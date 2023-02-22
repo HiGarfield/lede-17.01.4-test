@@ -32,7 +32,7 @@ jobs:
       contents: write
     env:
       TARGET_DEVICE: ${{ matrix.target }}
-      SOURCE_REPO: 'HiGarfield/lede-17.01.4-Mod'
+      SOURCE_REPO: 'HiGarfield/lede-17.01.4-test'
     strategy:
       max-parallel: 20
       matrix:
