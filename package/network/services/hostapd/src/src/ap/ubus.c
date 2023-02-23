@@ -21,7 +21,6 @@
 #include "rrm.h"
 #include "wnm_ap.h"
 #include "taxonomy.h"
-#include "airtime_policy.h"
 
 static struct ubus_context *ctx;
 static struct blob_buf b;
@@ -199,21 +198,6 @@ hostapd_bss_get_clients(struct ubus_context *ctx, struct ubus_object *obj,
 	return 0;
 }
 
-static int
-hostapd_bss_get_features(struct ubus_context *ctx, struct ubus_object *obj,
-			struct ubus_request_data *req, const char *method,
-			struct blob_attr *msg)
-{
-	struct hostapd_data *hapd = container_of(obj, struct hostapd_data, ubus.obj);
-
-	blob_buf_init(&b, 0);
-	blobmsg_add_u8(&b, "ht_supported", ht_supported(hapd->iface->hw_features));
-	blobmsg_add_u8(&b, "vht_supported", vht_supported(hapd->iface->hw_features));
-	ubus_send_reply(ctx, req, b.head);
-
-	return 0;
-}
-
 enum {
 	NOTIFY_RESPONSE,
 	__NOTIFY_MAX
@@ -383,26 +367,16 @@ hostapd_bss_update_beacon(struct ubus_context *ctx, struct ubus_object *obj,
 enum {
 	CSA_FREQ,
 	CSA_BCN_COUNT,
-	CSA_CENTER_FREQ1,
-	CSA_CENTER_FREQ2,
-	CSA_BANDWIDTH,
-	CSA_SEC_CHANNEL_OFFSET,
-	CSA_HT,
-	CSA_VHT,
-	CSA_BLOCK_TX,
 	__CSA_MAX
 };
 
 static const struct blobmsg_policy csa_policy[__CSA_MAX] = {
+	/*
+	 * for now, frequency and beacon count are enough, add more
+	 * parameters on demand
+	 */
 	[CSA_FREQ] = { "freq", BLOBMSG_TYPE_INT32 },
 	[CSA_BCN_COUNT] = { "bcn_count", BLOBMSG_TYPE_INT32 },
-	[CSA_CENTER_FREQ1] = { "center_freq1", BLOBMSG_TYPE_INT32 },
-	[CSA_CENTER_FREQ2] = { "center_freq2", BLOBMSG_TYPE_INT32 },
-	[CSA_BANDWIDTH] = { "bandwidth", BLOBMSG_TYPE_INT32 },
-	[CSA_SEC_CHANNEL_OFFSET] = { "sec_channel_offset", BLOBMSG_TYPE_INT32 },
-	[CSA_HT] = { "ht", BLOBMSG_TYPE_BOOL },
-	[CSA_VHT] = { "vht", BLOBMSG_TYPE_BOOL },
-	[CSA_BLOCK_TX] = { "block_tx", BLOBMSG_TYPE_BOOL },
 };
 
 #ifdef NEED_AP_MLME
@@ -422,27 +396,12 @@ hostapd_switch_chan(struct ubus_context *ctx, struct ubus_object *obj,
 
 	memset(&css, 0, sizeof(css));
 	css.freq_params.freq = blobmsg_get_u32(tb[CSA_FREQ]);
-
-#define SET_CSA_SETTING(name, field, type) \
-	do { \
-		if (tb[name]) \
-			css.field = blobmsg_get_ ## type(tb[name]); \
-	} while(0)
-
-	SET_CSA_SETTING(CSA_BCN_COUNT, cs_count, u32);
-	SET_CSA_SETTING(CSA_CENTER_FREQ1, freq_params.center_freq1, u32);
-	SET_CSA_SETTING(CSA_CENTER_FREQ2, freq_params.center_freq2, u32);
-	SET_CSA_SETTING(CSA_BANDWIDTH, freq_params.bandwidth, u32);
-	SET_CSA_SETTING(CSA_SEC_CHANNEL_OFFSET, freq_params.sec_channel_offset, u32);
-	SET_CSA_SETTING(CSA_HT, freq_params.ht_enabled, bool);
-	SET_CSA_SETTING(CSA_VHT, freq_params.vht_enabled, bool);
-	SET_CSA_SETTING(CSA_BLOCK_TX, block_tx, bool);
-
+	if (tb[CSA_BCN_COUNT])
+		css.cs_count = blobmsg_get_u32(tb[CSA_BCN_COUNT]);
 
 	if (hostapd_switch_channel(hapd, &css) != 0)
 		return UBUS_STATUS_NOT_SUPPORTED;
 	return UBUS_STATUS_OK;
-#undef SET_CSA_SETTING
 }
 #endif
 
@@ -547,7 +506,7 @@ __hostapd_bss_mgmt_enable_f(struct hostapd_data *hapd, int flag)
 
 		bss->radio_measurements[0] |=
 			WLAN_RRM_CAPS_NEIGHBOR_REPORT;
-		hostapd_neighbor_set_own_report(hapd);
+		hostapd_set_own_neighbor_report(hapd);
 		return true;
 	case BSS_MGMT_EN_BEACON:
 		flags = WLAN_RRM_CAPS_BEACON_REPORT_PASSIVE |
@@ -723,6 +682,7 @@ hostapd_rrm_nr_set(struct ubus_context *ctx, struct ubus_object *obj,
 	struct blob_attr *tb_l[__NR_SET_LIST_MAX];
 	struct blob_attr *tb[ARRAY_SIZE(nr_e_policy)];
 	struct blob_attr *cur;
+	int ret = 0;
 	int rem;
 
 	hostapd_rrm_nr_enable(hapd);
@@ -761,7 +721,7 @@ hostapd_rrm_nr_set(struct ubus_context *ctx, struct ubus_object *obj,
 		continue;
 
 invalid:
-		return UBUS_STATUS_INVALID_ARGUMENT;
+		ret = UBUS_STATUS_INVALID_ARGUMENT;
 	}
 
 	return 0;
@@ -940,62 +900,9 @@ hostapd_wnm_disassoc_imminent(struct ubus_context *ctx, struct ubus_object *obj,
 	if (nr)
 		req_mode |= WNM_BSS_TM_REQ_PREF_CAND_LIST_INCLUDED;
 
-	if (wnm_send_bss_tm_req(hapd, sta, req_mode, duration, duration, NULL,
+	if (wnm_send_bss_tm_req(hapd, sta, req_mode, duration, 0, NULL,
 				NULL, nr, nr_len, NULL, 0))
 		return UBUS_STATUS_UNKNOWN_ERROR;
-
-	return 0;
-}
-#endif
-
-#ifdef CONFIG_AIRTIME_POLICY
-enum {
-	UPDATE_AIRTIME_STA,
-	UPDATE_AIRTIME_WEIGHT,
-	__UPDATE_AIRTIME_MAX,
-};
-
-
-static const struct blobmsg_policy airtime_policy[__UPDATE_AIRTIME_MAX] = {
-	[UPDATE_AIRTIME_STA] = { "sta", BLOBMSG_TYPE_STRING },
-	[UPDATE_AIRTIME_WEIGHT] = { "weight", BLOBMSG_TYPE_INT32 },
-};
-
-static int
-hostapd_bss_update_airtime(struct ubus_context *ctx, struct ubus_object *obj,
-			   struct ubus_request_data *ureq, const char *method,
-			   struct blob_attr *msg)
-{
-	struct hostapd_data *hapd = container_of(obj, struct hostapd_data, ubus.obj);
-	struct blob_attr *tb[__UPDATE_AIRTIME_MAX];
-	struct sta_info *sta = NULL;
-	u8 addr[ETH_ALEN];
-	int weight;
-
-	blobmsg_parse(airtime_policy, __UPDATE_AIRTIME_MAX, tb, blob_data(msg), blob_len(msg));
-
-	if (!tb[UPDATE_AIRTIME_WEIGHT])
-		return UBUS_STATUS_INVALID_ARGUMENT;
-
-	weight = blobmsg_get_u32(tb[UPDATE_AIRTIME_WEIGHT]);
-
-	if (!tb[UPDATE_AIRTIME_STA]) {
-		if (!weight)
-			return UBUS_STATUS_INVALID_ARGUMENT;
-
-		hapd->conf->airtime_weight = weight;
-		return 0;
-	}
-
-	if (hwaddr_aton(blobmsg_data(tb[UPDATE_AIRTIME_STA]), addr))
-		return UBUS_STATUS_INVALID_ARGUMENT;
-
-	sta = ap_get_sta(hapd, addr);
-	if (!sta)
-		return UBUS_STATUS_NOT_FOUND;
-
-	sta->dyn_airtime_weight = weight;
-	airtime_policy_new_sta(hapd, sta);
 
 	return 0;
 }
@@ -1004,14 +911,10 @@ hostapd_bss_update_airtime(struct ubus_context *ctx, struct ubus_object *obj,
 static const struct ubus_method bss_methods[] = {
 	UBUS_METHOD_NOARG("get_clients", hostapd_bss_get_clients),
 	UBUS_METHOD("del_client", hostapd_bss_del_client, del_policy),
-#ifdef CONFIG_AIRTIME_POLICY
-	UBUS_METHOD("update_airtime", hostapd_bss_update_airtime, airtime_policy),
-#endif
 	UBUS_METHOD_NOARG("list_bans", hostapd_bss_list_bans),
 	UBUS_METHOD_NOARG("wps_start", hostapd_bss_wps_start),
 	UBUS_METHOD_NOARG("wps_cancel", hostapd_bss_wps_cancel),
 	UBUS_METHOD_NOARG("update_beacon", hostapd_bss_update_beacon),
-	UBUS_METHOD_NOARG("get_features", hostapd_bss_get_features),
 #ifdef NEED_AP_MLME
 	UBUS_METHOD("switch_chan", hostapd_switch_chan, csa_policy),
 #endif
@@ -1065,11 +968,6 @@ void hostapd_ubus_free_bss(struct hostapd_data *hapd)
 {
 	struct ubus_object *obj = &hapd->ubus.obj;
 	char *name = (char *) obj->name;
-
-#ifdef CONFIG_MESH
-	if (hapd->conf->mesh & MESH_ENABLED)
-		return;
-#endif
 
 	if (!ctx)
 		return;
@@ -1126,50 +1024,9 @@ int hostapd_ubus_handle_event(struct hostapd_data *hapd, struct hostapd_ubus_req
 	blobmsg_add_macaddr(&b, "address", addr);
 	if (req->mgmt_frame)
 		blobmsg_add_macaddr(&b, "target", req->mgmt_frame->da);
-	if (req->ssi_signal)
-		blobmsg_add_u32(&b, "signal", req->ssi_signal);
+	if (req->frame_info)
+		blobmsg_add_u32(&b, "signal", req->frame_info->ssi_signal);
 	blobmsg_add_u32(&b, "freq", hapd->iface->freq);
-
-	if (req->elems) {
-		if(req->elems->ht_capabilities)
-		{
-			struct ieee80211_ht_capabilities *ht_capabilities;
-			void *ht_cap, *ht_cap_mcs_set, *mcs_set;
-
-
-			ht_capabilities = (struct ieee80211_ht_capabilities*) req->elems->ht_capabilities;
-			ht_cap = blobmsg_open_table(&b, "ht_capabilities");
-			blobmsg_add_u16(&b, "ht_capabilities_info", ht_capabilities->ht_capabilities_info);
-			ht_cap_mcs_set = blobmsg_open_table(&b, "supported_mcs_set");		
-			blobmsg_add_u16(&b, "a_mpdu_params", ht_capabilities->a_mpdu_params);
-			blobmsg_add_u16(&b, "ht_extended_capabilities", ht_capabilities->ht_extended_capabilities);
-			blobmsg_add_u32(&b, "tx_bf_capability_info", ht_capabilities->tx_bf_capability_info);
-			blobmsg_add_u16(&b, "asel_capabilities", ht_capabilities->asel_capabilities);
-			mcs_set = blobmsg_open_array(&b, "supported_mcs_set");
-			for (int i = 0; i < 16; i++) {
-				blobmsg_add_u16(&b, NULL, (u16) ht_capabilities->supported_mcs_set[i]);
-			}
-			blobmsg_close_array(&b, mcs_set);
-			blobmsg_close_table(&b, ht_cap_mcs_set);
-			blobmsg_close_table(&b, ht_cap);		
-		}
-		if(req->elems->vht_capabilities)
-		{
-			struct ieee80211_vht_capabilities *vht_capabilities;
-			void *vht_cap, *vht_cap_mcs_set;
-
-			vht_capabilities = (struct ieee80211_vht_capabilities*) req->elems->vht_capabilities;
-			vht_cap = blobmsg_open_table(&b, "vht_capabilities");
-			blobmsg_add_u32(&b, "vht_capabilities_info", vht_capabilities->vht_capabilities_info);
-			vht_cap_mcs_set = blobmsg_open_table(&b, "vht_supported_mcs_set");
-			blobmsg_add_u16(&b, "rx_map", vht_capabilities->vht_supported_mcs_set.rx_map);
-			blobmsg_add_u16(&b, "rx_highest", vht_capabilities->vht_supported_mcs_set.rx_highest);
-			blobmsg_add_u16(&b, "tx_map", vht_capabilities->vht_supported_mcs_set.tx_map);
-			blobmsg_add_u16(&b, "tx_highest", vht_capabilities->vht_supported_mcs_set.tx_highest);
-			blobmsg_close_table(&b, vht_cap_mcs_set);
-			blobmsg_close_table(&b, vht_cap);
-		}
-	}
 
 	if (!hapd->ubus.notify_response) {
 		ubus_notify(ctx, &hapd->ubus.obj, type, b.head, -1);
@@ -1200,31 +1057,4 @@ void hostapd_ubus_notify(struct hostapd_data *hapd, const char *type, const u8 *
 	blobmsg_add_macaddr(&b, "address", addr);
 
 	ubus_notify(ctx, &hapd->ubus.obj, type, b.head, -1);
-}
-
-void hostapd_ubus_notify_beacon_report(
-	struct hostapd_data *hapd, const u8 *addr, u8 token, u8 rep_mode,
-	struct rrm_measurement_beacon_report *rep, size_t len)
-{
-	if (!hapd->ubus.obj.has_subscribers)
-		return;
-
-	if (!addr || !rep)
-		return;
-
-	blob_buf_init(&b, 0);
-	blobmsg_add_macaddr(&b, "address", addr);
-	blobmsg_add_u16(&b, "op-class", rep->op_class);
-	blobmsg_add_u16(&b, "channel", rep->channel);
-	blobmsg_add_u64(&b, "start-time", rep->start_time);
-	blobmsg_add_u16(&b, "duration", rep->duration);
-	blobmsg_add_u16(&b, "report-info", rep->report_info);
-	blobmsg_add_u16(&b, "rcpi", rep->rcpi);
-	blobmsg_add_u16(&b, "rsni", rep->rsni);
-	blobmsg_add_macaddr(&b, "bssid", rep->bssid);
-	blobmsg_add_u16(&b, "antenna-id", rep->antenna_id);
-	blobmsg_add_u16(&b, "parent-tsf", rep->parent_tsf);
-	blobmsg_add_u16(&b, "rep-mode", rep_mode);
-
-	ubus_notify(ctx, &hapd->ubus.obj, "beacon-report", b.head, -1);
 }
